@@ -1,0 +1,473 @@
+#!/usr/bin/env bash
+# mcp-reconnect — Reconnect MCP servers in Claude Code tmux sessions via key injection.
+#
+# Claude Code has no programmatic API for MCP reconnect. The only way is through
+# the interactive /mcp menu. This script automates that sequence via tmux send-keys.
+#
+# Key sequence:
+#   Escape        → stop any active generation
+#   /mcp + Enter  → submit the /mcp slash command
+#   Enter         → enter the menu
+#   Down + Enter  → select "Reconnect" (2nd option)
+#   <prompt>      → continuation message so Claude resumes work
+#
+# Usage:
+#   mcp-reconnect                          # All local Claude sessions
+#   mcp-reconnect weaver claude            # Specific sessions by name
+#   mcp-reconnect --remote devbox          # All Claude sessions on remote host
+#   mcp-reconnect --remote devbox weaver   # Specific session on remote host
+#   mcp-reconnect --delay 10               # Wait N seconds before starting (detached use)
+#   mcp-reconnect --path Reconnect         # Select menu items by visible text
+#
+# Requirements:
+#   - tmux (Claude Code sessions must be running inside tmux)
+#   - ssh (for --remote, with key-based auth configured)
+#
+# Design notes (learned the hard way):
+#   - When called from within a Claude Code session (e.g., a deploy hook), use
+#     --delay with nohup/disown so the calling session's bash tool returns before
+#     Escape hits: nohup mcp-reconnect --delay 10 &>/dev/null & disown
+#   - Settle times are conservative. Shorter waits cause missed keystrokes.
+#   - Local sessions run in parallel (each targets a different tmux pane, no
+#     contention). Remote sessions run sequentially over SSH.
+
+set -euo pipefail
+
+# --- Configuration -----------------------------------------------------------
+
+SETTLE_AFTER_ESC=5        # Seconds after Escape (let generation stop)
+SETTLE_AFTER_MCP=2        # Seconds after /mcp submit (menu render time)
+SETTLE_AFTER_SELECT=5     # Seconds after selecting Reconnect
+MENU_STEP_DELAY="${CCR_MENU_STEP_DELAY:-0.5}"  # Delay between text-match menu levels
+DELAY=0                   # Pre-start delay (--delay flag)
+CONTINUATION_MSG="MCP servers reconnected with latest deployed code. Continue."
+
+# --- Functions ---------------------------------------------------------------
+
+usage() {
+    cat <<'EOF'
+Usage: mcp-reconnect [OPTIONS] [SESSION...]
+
+Reconnect MCP servers in Claude Code tmux sessions.
+
+Arguments:
+  SESSION...              Specific tmux session names (default: auto-detect all)
+
+Options:
+  --remote HOST           Reconnect sessions on a remote machine via SSH
+  --delay SECONDS         Wait before starting (for detached/nohup use cases)
+  --settle-esc SECONDS    Override post-Escape settle time (default: 5)
+  --settle-mcp SECONDS    Override post-/mcp settle time (default: 2)
+  --settle-select SECONDS Override post-Reconnect settle time (default: 5)
+  --path LABEL            Select a visible /mcp menu label (repeat for submenus)
+  --server NAME           Target a specific MCP server by name (uses cursor tracking)
+  --exclude SESSION       Skip this tmux session (for caller exclusion)
+  --message MSG           Override the continuation prompt sent after reconnect
+  --dry-run               Show what would be done without sending keys
+  --help                  Show this help message
+
+Examples:
+  mcp-reconnect                              # Auto-detect and reconnect all
+  mcp-reconnect --remote myserver            # Reconnect on remote host
+  mcp-reconnect --delay 10                   # Delayed start (nohup use case)
+  mcp-reconnect --dry-run                    # Preview without executing
+  mcp-reconnect --server taeys-hands         # Reconnect specific MCP server
+  mcp-reconnect --path Reconnect             # Select Reconnect by text
+  mcp-reconnect --path taeys-hands --path Reconnect
+                                               # Select server, then Reconnect
+  mcp-reconnect --path taeys-hands --path "Show details"
+                                               # Navigate arbitrary submenu paths
+  mcp-reconnect --exclude caller-session     # Skip the calling session
+EOF
+    exit 0
+}
+
+die() { echo "[mcp-reconnect] ERROR: $*" >&2; exit 1; }
+die2() { echo "[mcp-reconnect] ERROR: $*" >&2; exit 2; }
+
+# Kill any previous mcp-reconnect processes (stale from prior deploys)
+cleanup_previous() {
+    local my_pid=$$
+    local my_ppid
+    my_ppid=$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')
+    local stale_pids
+    # Match only 'bin/mcp-reconnect' processes, excluding ourselves and our
+    # direct parent (which matches when invoked as 'bash bin/mcp-reconnect').
+    stale_pids=$(
+        pgrep -f 'bin/mcp-reconnect' 2>/dev/null \
+            | grep -v -e "^${my_pid}$" -e "^${my_ppid}$" \
+            || true
+    )
+    if [ -n "$stale_pids" ]; then
+        echo "[mcp-reconnect] Killing stale mcp-reconnect processes: $stale_pids"
+        echo "$stale_pids" | xargs kill 2>/dev/null || true
+    fi
+}
+
+get_claude_sessions() {
+    local sessions=()
+    local session_list
+    session_list=$(tmux list-sessions -F '#{session_name}' 2>/dev/null) || return 0
+    while IFS= read -r session; do
+        [ -z "$session" ] && continue
+        local cmd
+        cmd=$(tmux display-message -t "$session" -p '#{pane_current_command}' 2>/dev/null || echo "")
+        if [ "$cmd" = "claude" ]; then
+            sessions+=("$session")
+        fi
+    done <<< "$session_list"
+    [ ${#sessions[@]} -gt 0 ] && printf '%s\n' "${sessions[@]}"
+}
+
+# Wait for /mcp menu to render. Returns 0 if detected, 1 if timeout.
+# This is a soft check — callers should fall through to timing-based approach on failure.
+wait_for_menu() {
+    local session="$1"
+    local max_wait="${2:-5}"
+    for attempt in $(seq 1 "$max_wait"); do
+        local screen
+        screen=$(tmux capture-pane -t "$session" -p 2>/dev/null || true)
+        # Check for known menu indicators across Claude Code versions
+        if echo "$screen" | grep -qE "to navigate|Manage MCP|MCP Servers"; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# Return the current menu cursor line from a tmux pane.
+#
+# In Claude Code's TUI, `❯` appears in three places:
+#   1. The slash-command echo line at column 0 (e.g. `❯ /mcp`) — what the
+#      user just typed, rendered at the top of the conversation thread.
+#   2. The input-box prompt `❯ ` at the very bottom of the pane (when no
+#      menu is blocking the input area).
+#   3. The active MENU cursor — always indented with leading whitespace
+#      (e.g. `  ❯ 1. View tools`, `  ❯ 2. Reconnect`).
+#
+# Only #3 is the menu cursor we navigate. Filter by leading whitespace
+# before `❯` to isolate it. Use `tail -n 1` so that if multiple menus are
+# stacked (a deeper submenu inside a parent), we get the innermost one
+# (visually lower on screen). 2026-05-26: bug fix — prior `head -n 1`
+# returned the slash-command echo line, never the menu cursor, causing
+# cycle-detection to fire on the first iteration.
+get_cursor_line() {
+    local session="$1"
+    tmux capture-pane -t "$session" -p 2>/dev/null | grep -E '^[[:space:]]+❯' | tail -n 1 || true
+}
+
+# Navigate to a visible menu item by fixed-string text match.
+navigate_to() {
+    local session="$1"
+    local target_text="$2"
+    local max_steps="${3:-25}"
+    local cursor_line
+    local seen_lines=()
+
+    for attempt in $(seq 0 "$max_steps"); do
+        cursor_line=$(get_cursor_line "$session")
+        if [ -z "$cursor_line" ]; then
+            echo "[mcp-reconnect] ERROR: $session: no cursor marker found while looking for '$target_text'" >&2
+            return 1
+        fi
+
+        if printf '%s\n' "$cursor_line" | grep -Fqi -- "$target_text"; then
+            echo "[mcp-reconnect] $session: cursor on '$target_text' (attempt $attempt)"
+            return 0
+        fi
+
+        local seen
+        for seen in "${seen_lines[@]}"; do
+            if [ "$seen" = "$cursor_line" ]; then
+                echo "[mcp-reconnect] ERROR: $session: target '$target_text' not found in any visible menu position" >&2
+                return 1
+            fi
+        done
+        seen_lines+=("$cursor_line")
+
+        if [ "$attempt" -eq "$max_steps" ]; then
+            break
+        fi
+        tmux send-keys -t "$session" Down
+        sleep 0.3
+    done
+
+    echo "[mcp-reconnect] ERROR: $session: target '$target_text' not found after ${max_steps} navigation steps" >&2
+    return 1
+}
+
+# Navigate to a specific server in the /mcp menu using cursor tracking.
+navigate_to_server() {
+    navigate_to "$1" "$2" 25
+}
+
+# Navigate to "Reconnect" in a server's submenu.
+navigate_to_reconnect() {
+    navigate_to "$1" "Reconnect" 25
+}
+
+reconnect_session() {
+    local session="$1"
+
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        echo "[mcp-reconnect] DRY RUN: would reconnect session '$session'"
+        return 0
+    fi
+
+    # Step 1: Escape — stop any active generation
+    echo "[mcp-reconnect] $session: sending Escape..."
+    tmux send-keys -t "$session" Escape
+    sleep "$SETTLE_AFTER_ESC"
+
+    # Step 2: /mcp + Enter — open the MCP menu
+    # Send BOTH legacy Enter and Kitty-protocol CSI-u Enter (bytes 1b 5b 31 33 75).
+    # Claude Code's Ink TUI needs CSI-u Enter to reliably submit in many modal
+    # states; legacy Enter alone is unreliable in Claude Code 2.1.150 — verified
+    # 2026-05-26 live test where legacy-only submitted /mcp but the dialog
+    # auto-dismissed before navigate_to could interact with it. Same submit
+    # chain as claude-code-api-watchdog (verified pattern).
+    echo "[mcp-reconnect] $session: sending /mcp + Enter (legacy + CSI-u)..."
+    tmux send-keys -t "$session" -l "/mcp"
+    sleep 0.3
+    tmux send-keys -t "$session" Enter
+    sleep 0.1
+    tmux send-keys -t "$session" -H 1b 5b 31 33 75
+
+    # Step 3: Wait for menu to render (soft check — fall through on timeout)
+    local menu_detected=0
+    if wait_for_menu "$session" 5; then
+        menu_detected=1
+        echo "[mcp-reconnect] $session: menu detected"
+    else
+        echo "[mcp-reconnect] $session: menu detection timeout — using timing-based fallback"
+        sleep "$SETTLE_AFTER_MCP"
+    fi
+
+    # Step 4: Navigate and select Reconnect
+    if [ ${#PATH_LABELS[@]} -gt 0 ]; then
+        if [ $menu_detected -ne 1 ]; then
+            die "$session: /mcp menu was not detected; cannot use --path navigation"
+        fi
+        local label
+        for label in "${PATH_LABELS[@]}"; do
+            if ! navigate_to "$session" "$label" 25; then
+                tmux send-keys -t "$session" Escape 2>/dev/null || true
+                die "$session: failed to navigate to path label '$label'"
+            fi
+            tmux send-keys -t "$session" Enter
+            sleep "$MENU_STEP_DELAY"
+        done
+    else
+        # Default behavior (v1.1.0 proven pattern): Enter → Down → Enter
+        echo "[mcp-reconnect] $session: Enter (menu) → Down → Enter (reconnect)..."
+        tmux send-keys -t "$session" Enter
+        sleep 0.5
+        tmux send-keys -t "$session" Down
+        sleep 0.3
+        tmux send-keys -t "$session" Enter
+    fi
+
+    # Step 5: Wait for reconnection
+    # Try signal-based wait first (look for "Reconnected to" in pane),
+    # fall back to fixed timer if signal not detected
+    echo "[mcp-reconnect] $session: waiting for reconnection..."
+    local reconnect_confirmed=0
+    for _w in $(seq 1 "$SETTLE_AFTER_SELECT"); do
+        if tmux capture-pane -t "$session" -p 2>/dev/null | grep -qi "Reconnected"; then
+            echo "[mcp-reconnect] $session: reconnection confirmed"
+            reconnect_confirmed=1
+            break
+        fi
+        sleep 1
+    done
+    if [ $reconnect_confirmed -eq 0 ]; then
+        echo "[mcp-reconnect] $session: no reconnection signal — waited ${SETTLE_AFTER_SELECT}s (may still be OK)"
+    fi
+
+    # Step 6: Send continuation prompt (suppress for raw --path unless --message given).
+    #
+    # The default CONTINUATION_MSG is reconnect-specific ("MCP servers reconnected
+    # with latest deployed code. Continue.") — it would be a lie for non-Reconnect
+    # paths like `--path "View tools"` or `--path Disable`. Per Family validation
+    # 2026-05-25 design-decision (d) (Claude HOLD, lean over explicit-control):
+    # suppress by default when raw --path is used; --server (the Reconnect
+    # shorthand) keeps the message; bare invocation keeps the message;
+    # --message <text> always sends (operator override).
+    if [ ${#PATH_LABELS[@]} -gt 0 ] && [ -z "$TARGET_SERVER" ] && [ "${MESSAGE_EXPLICIT:-0}" = "0" ]; then
+        echo "[mcp-reconnect] $session: raw --path used + no --message — skipping default continuation prompt"
+    else
+        echo "[mcp-reconnect] $session: sending continuation prompt..."
+        # Clear any stale input first (C-a = beginning of line, C-k = kill to end)
+        tmux send-keys -t "$session" C-a C-k
+        sleep 0.2
+        tmux send-keys -t "$session" -l "$CONTINUATION_MSG"
+        sleep 0.3
+        tmux send-keys -t "$session" Enter
+    fi
+
+    echo "[mcp-reconnect] $session: done"
+}
+
+reconnect_remote() {
+    local host="$1"
+    shift
+    local sessions=("$@")
+
+    echo "[mcp-reconnect] Remote: $host"
+
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        echo "[mcp-reconnect] DRY RUN: would reconnect on remote host '$host'"
+        return 0
+    fi
+
+    # If no specific sessions given, find Claude sessions on remote
+    if [ ${#sessions[@]} -eq 0 ]; then
+        local remote_sessions
+        remote_sessions=$(ssh -o ConnectTimeout=5 "$host" bash -c '
+            for s in $(tmux list-sessions -F "#{session_name}" 2>/dev/null); do
+                cmd=$(tmux display-message -t "$s" -p "#{pane_current_command}" 2>/dev/null || echo "")
+                [ "$cmd" = "claude" ] && echo "$s"
+            done
+        ' 2>/dev/null) || die "SSH connection to $host failed"
+
+        if [ -z "$remote_sessions" ]; then
+            echo "[mcp-reconnect] $host: no Claude sessions found"
+            return 0
+        fi
+        mapfile -t sessions <<< "$remote_sessions"
+    fi
+
+    # Sequential over SSH — one session at a time
+    for session in "${sessions[@]}"; do
+        [ -z "$session" ] && continue
+        echo "[mcp-reconnect] $host/$session: reconnecting..."
+        ssh -o ConnectTimeout=5 "$host" bash -s -- "$session" \
+            "$SETTLE_AFTER_ESC" "$SETTLE_AFTER_MCP" "$SETTLE_AFTER_SELECT" \
+            "$CONTINUATION_MSG" <<'RECONNECT_EOF'
+SESSION="$1"; T_ESC="$2"; T_MCP="$3"; T_SEL="$4"; MSG="$5"
+tmux send-keys -t "$SESSION" Escape
+sleep "$T_ESC"
+tmux send-keys -t "$SESSION" -l "/mcp"
+sleep 0.3
+tmux send-keys -t "$SESSION" Enter
+sleep "$T_MCP"
+tmux send-keys -t "$SESSION" Enter
+sleep 0.5
+tmux send-keys -t "$SESSION" Down
+sleep 0.3
+tmux send-keys -t "$SESSION" Enter
+sleep "$T_SEL"
+tmux send-keys -t "$SESSION" C-a C-k
+sleep 0.2
+tmux send-keys -t "$SESSION" -l "$MSG"
+sleep 0.3
+tmux send-keys -t "$SESSION" Enter
+echo "[mcp-reconnect] $SESSION: done"
+RECONNECT_EOF
+    done
+}
+
+# --- Argument Parsing --------------------------------------------------------
+
+DRY_RUN=0
+REMOTE_HOST=""
+TARGET_SERVER=""
+EXCLUDE_SESSION=""
+PATH_LABELS=()
+POSITIONAL=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help|-h)          usage ;;
+        --remote)           REMOTE_HOST="${2:?--remote requires a hostname}"; shift 2 ;;
+        --delay)            DELAY="${2:?--delay requires a number}"; shift 2 ;;
+        --settle-esc)       SETTLE_AFTER_ESC="${2:?--settle-esc requires a number}"; shift 2 ;;
+        --settle-mcp)       SETTLE_AFTER_MCP="${2:?--settle-mcp requires a number}"; shift 2 ;;
+        --settle-select)    SETTLE_AFTER_SELECT="${2:?--settle-select requires a number}"; shift 2 ;;
+        --message)          CONTINUATION_MSG="${2:?--message requires text}"; MESSAGE_EXPLICIT=1; shift 2 ;;
+        --path)             PATH_LABELS+=("${2:?--path requires a label}"); shift 2 ;;
+        --server)           TARGET_SERVER="${2:?--server requires a server name}"; shift 2 ;;
+        --exclude)          EXCLUDE_SESSION="${2:?--exclude requires a session name}"; shift 2 ;;
+        --dry-run)          DRY_RUN=1; shift ;;
+        -*)                 die "Unknown option: $1" ;;
+        *)                  POSITIONAL+=("$1"); shift ;;
+    esac
+done
+
+if [ -n "$TARGET_SERVER" ] && [ ${#PATH_LABELS[@]} -gt 0 ]; then
+    die2 "--path and --server are mutually exclusive"
+fi
+
+if [ -n "$TARGET_SERVER" ]; then
+    PATH_LABELS=("$TARGET_SERVER" "Reconnect")
+fi
+
+if [ -n "$REMOTE_HOST" ] && [ ${#PATH_LABELS[@]} -gt 0 ]; then
+    die2 "--path over --remote not yet supported; use local invocation"
+fi
+
+# --- Main --------------------------------------------------------------------
+
+# Kill stale instances from prior runs
+cleanup_previous
+
+# Pre-start delay (for nohup/detached use case)
+if [ "$DELAY" -gt 0 ] 2>/dev/null; then
+    echo "[mcp-reconnect] Waiting ${DELAY}s before starting..."
+    sleep "$DELAY"
+fi
+
+# Remote mode
+if [ -n "$REMOTE_HOST" ]; then
+    reconnect_remote "$REMOTE_HOST" "${POSITIONAL[@]}"
+    exit 0
+fi
+
+# Local mode
+if [ ${#POSITIONAL[@]} -gt 0 ]; then
+    SESSIONS=("${POSITIONAL[@]}")
+else
+    mapfile -t SESSIONS < <(get_claude_sessions)
+fi
+
+# Filter out excluded session (e.g., the caller)
+if [ -n "$EXCLUDE_SESSION" ] && [ ${#SESSIONS[@]} -gt 0 ]; then
+    FILTERED=()
+    for s in "${SESSIONS[@]}"; do
+        if [ "$s" != "$EXCLUDE_SESSION" ]; then
+            FILTERED+=("$s")
+        else
+            echo "[mcp-reconnect] Excluding session '$s' (caller)"
+        fi
+    done
+    SESSIONS=("${FILTERED[@]}")
+fi
+
+if [ ${#SESSIONS[@]} -eq 0 ]; then
+    echo "[mcp-reconnect] No Claude Code sessions found in tmux"
+    exit 0
+fi
+
+echo "[mcp-reconnect] Reconnecting ${#SESSIONS[@]} session(s): ${SESSIONS[*]}"
+
+# Parallel — each session targets a different tmux pane, no contention
+PIDS=()
+for session in "${SESSIONS[@]}"; do
+    [ -z "$session" ] && continue
+    reconnect_session "$session" &
+    PIDS+=("$!")
+done
+
+FAILURES=0
+for pid in "${PIDS[@]}"; do
+    if ! wait "$pid"; then
+        FAILURES=$((FAILURES + 1))
+    fi
+done
+
+if [ "$FAILURES" -gt 0 ]; then
+    die "$FAILURES session(s) failed"
+fi
+
+echo "[mcp-reconnect] All sessions reconnected"
